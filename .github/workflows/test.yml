@@ -1,0 +1,74 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every version requires-python advertises.
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install .[dev]
+
+      - name: Test
+        run: python -m pytest
+
+      # The provider is loaded by class path from a user's config, so an import
+      # error surfaces at octodns-sync startup rather than at install time.
+      - name: Provider is importable
+        run: python -c "from octodns_nexdns import NexdnsProvider; print(NexdnsProvider)"
+
+      # Publication guard. Deliberately an allowlist: this file is public, so it
+      # must not enumerate the internal hosts it exists to keep out. Anything
+      # resembling a host that is not on the permitted list is a finding, as is
+      # any file that belongs to the private working tree rather than the
+      # artifact.
+      - name: Nothing internal is being published
+        run: |
+          set -u
+          fail=0
+
+          # An allowlist of permitted top-level entries, not a list of the ones
+          # that must not appear: naming those would put them in a public file,
+          # which is the leak this step exists to prevent.
+          unexpected=$(git ls-files | grep -oE '^\.[^/]+' | sort -u \
+                       | grep -vE '^(\.github|\.gitignore|\.gitattributes|\.golangci\.yml|\.goreleaser\.yml)$' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::unexpected top-level entries for a published repository:"
+            echo "$unexpected"
+            fail=1
+          fi
+
+          if git ls-files | grep -qE '(^|/)([^/]+\.egg-info|__pycache__)(/|$)'; then
+            echo "::error::build artifacts are committed; they are regenerated and must not be"
+            fail=1
+          fi
+
+          # Hostnames appearing in tracked text, minus the ones a public artifact
+          # may legitimately name.
+          allowed='github\.com|nexdns\.tech|pypi\.org|registry\.terraform\.io|hub\.docker\.com|docker\.io|golang\.org|go\.dev|letsencrypt\.org|acme-v02\.api\.letsencrypt\.org|cert-manager\.io|acme\.sh|go-acme\.github\.io|traefik\.io|opencontainers\.org|apache\.org|keepachangelog\.com|semver\.org|schema\.org|img\.shields\.io|example\.com|example\.net|example\.org|herokuapp\.com|google\.com|goreleaser\.com|octodns|hashicorp\.com|terraform\.io'
+          hits=$(git grep -hoE '[a-z0-9-]+(\.[a-z0-9-]+)+\.(net|com|io|org|dev|ru|tech|local)' -- . \
+                 | sort -u | grep -vE "(^|\\.)($allowed)$" || true)
+          if [ -n "$hits" ]; then
+            echo "::error::hostnames not on the permitted list appear in this repository:"
+            echo "$hits"
+            fail=1
+          fi
+
+          exit $fail
