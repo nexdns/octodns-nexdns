@@ -1,6 +1,8 @@
 """OctoDNS provider for NexDNS."""
 
 from logging import getLogger
+from time import sleep
+
 from requests import Session
 
 from octodns.provider.base import BaseProvider
@@ -10,6 +12,21 @@ from octodns.record import Record
 # requests applies no timeout of its own, so a half-open connection would hang
 # octodns-sync forever - in CI, a stuck job holding a half-finished apply.
 DEFAULT_TIMEOUT = 30
+
+# An apply sends one request per record, so a zone of any size outruns the
+# account's per-minute budget and starts meeting 429s. Failing there is the
+# worst outcome available: an apply is not a transaction, so the zone is left
+# holding some of the intended changes and none of the rest, and the operator
+# has to work out which.
+#
+# Retry-After is honoured as a lower bound rather than as the answer. It is the
+# right number from a current deployment, but the value used to understate the
+# wait, and a plugin released today will be talking to installations that have
+# not been updated - a client that cannot make progress against them is the
+# same broken apply.
+INITIAL_RATE_LIMIT_BACKOFF = 2
+MAX_RATE_LIMIT_BACKOFF = 60
+MAX_RATE_LIMIT_WAIT = 180
 
 class NexdnsProvider(BaseProvider):
     """NexDNS DNS provider for OctoDNS.
@@ -358,10 +375,35 @@ class NexdnsProvider(BaseProvider):
         return None
 
     def _request(self, path, method='GET', **kwargs):
-        """Make an API request."""
+        """Make an API request, waiting out the account's rate limit.
+
+        A 429 is retried for every method, not only for reads: the budget is
+        checked before the request is executed, so a refused write had no
+        effect and replaying it cannot apply anything twice.
+        """
         url = f'{self._api_url}{path}'
         kwargs.setdefault('timeout', self._timeout)
-        resp = self._session.request(method, url, **kwargs)
+
+        waited = 0
+        backoff = INITIAL_RATE_LIMIT_BACKOFF
+
+        while True:
+            resp = self._session.request(method, url, **kwargs)
+
+            if resp.status_code != 429:
+                break
+
+            wait = max(self._retry_after(resp), backoff)
+            if waited + wait > MAX_RATE_LIMIT_WAIT:
+                break
+
+            self.log.warning(
+                '_request: rate limited, waiting %ds before retrying %s %s',
+                wait, method, path,
+            )
+            sleep(wait)
+            waited += wait
+            backoff = min(backoff * 2, MAX_RATE_LIMIT_BACKOFF)
 
         if resp.status_code == 204:
             return {}
@@ -389,6 +431,20 @@ class NexdnsProvider(BaseProvider):
             raise Exception(f'NexDNS API error: {message}')
 
         return data
+
+    @staticmethod
+    def _retry_after(resp):
+        """Seconds the response asks the caller to wait, 0 when it does not say.
+
+        Retry-After may also be an HTTP date by RFC 9110. This API sends
+        seconds, and a date form is left to the backoff rather than parsed,
+        because guessing wrong about a date is worse than waiting a known
+        interval.
+        """
+        try:
+            return max(0, int(resp.headers.get('Retry-After', '')))
+        except ValueError:
+            return 0
 
     @staticmethod
     def _api_name(name):

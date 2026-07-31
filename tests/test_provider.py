@@ -139,3 +139,109 @@ def test_ns_group_is_accepted_and_sent_on_zone_create():
 
     assert provider._ns_group == 'example-group'
     assert NexdnsProvider('test', token='nxd_x')._ns_group is None
+
+
+class _FakeResponse:
+    """Enough of a requests.Response for _request to work with."""
+
+    def __init__(self, status_code, headers=None, payload=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """Answers with a scripted sequence and records what it was asked."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url))
+        return self._responses.pop(0) if self._responses else _FakeResponse(200)
+
+
+def _provider_with(responses, monkeypatch):
+    """A provider whose session is scripted and whose waiting is instantaneous."""
+    slept = []
+    monkeypatch.setattr('octodns_nexdns.sleep', slept.append)
+
+    provider = NexdnsProvider('test', token='nxd_x')
+    provider._session = _FakeSession(responses)
+
+    return provider, slept
+
+
+def test_rate_limited_request_is_retried(monkeypatch):
+    """An apply sends one request per record and will meet the budget."""
+    provider, _ = _provider_with([
+        _FakeResponse(429, {'Retry-After': '5'}),
+        _FakeResponse(200, payload={'data': []}),
+    ], monkeypatch)
+
+    assert provider._request('/zones') == {'data': []}
+    assert len(provider._session.calls) == 2
+
+
+def test_rate_limit_wait_grows_beyond_the_advertised_retry_after(monkeypatch):
+    """Retry-After is a lower bound, not the answer.
+
+    An installation that has not been updated advertises a wait far shorter
+    than the one it will honour, and a client that takes it literally retries
+    into the same refusal until it gives up with the apply half done.
+    """
+    provider, slept = _provider_with([
+        _FakeResponse(429, {'Retry-After': '1'}),
+        _FakeResponse(429, {'Retry-After': '1'}),
+        _FakeResponse(429, {'Retry-After': '1'}),
+        _FakeResponse(200, payload={'data': []}),
+    ], monkeypatch)
+
+    provider._request('/zones')
+
+    assert slept == [2, 4, 8]
+
+
+def test_a_longer_retry_after_is_honoured(monkeypatch):
+    """Backing off must never shorten a wait the server asked for."""
+    provider, slept = _provider_with([
+        _FakeResponse(429, {'Retry-After': '45'}),
+        _FakeResponse(200, payload={'data': []}),
+    ], monkeypatch)
+
+    provider._request('/zones')
+
+    assert slept == [45]
+
+
+def test_rate_limit_retrying_stops_at_the_wait_budget(monkeypatch):
+    """Waiting cannot go on forever: the caller gets the API's own error."""
+    provider, slept = _provider_with(
+        [_FakeResponse(429, {'Retry-After': '1'},
+                       {'error': {'message': 'Too many requests.'}})] * 40,
+        monkeypatch,
+    )
+
+    try:
+        provider._request('/zones')
+    except Exception as err:
+        assert 'Too many requests.' in str(err)
+    else:
+        raise AssertionError('_request should have raised')
+
+    assert sum(slept) <= 180
+
+
+def test_a_write_is_retried_too(monkeypatch):
+    """The budget is checked before the write runs, so replaying is safe."""
+    provider, _ = _provider_with([
+        _FakeResponse(429, {'Retry-After': '1'}),
+        _FakeResponse(204),
+    ], monkeypatch)
+
+    assert provider._request('/zones/z1/records/r1', method='DELETE') == {}
+    assert [m for m, _ in provider._session.calls] == ['DELETE', 'DELETE']
