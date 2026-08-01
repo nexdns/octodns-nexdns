@@ -46,4 +46,10 @@ jobs:
           name: dist
           path: dist/
 
+      # A release tag can be re-pushed - to correct commit metadata, or to
+      # recover a run that failed after the upload. PyPI refuses a second
+      # upload of a version that already exists, which would fail the job
+      # for a file it already has; treat that as the no-op it is.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
